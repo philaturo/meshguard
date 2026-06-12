@@ -14,7 +14,7 @@ export function useWebSocket() {
     const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const connect = useCallback(() => {
-        const ws = new WebSocket('ws://localhost:8080/ws');
+        const ws = new WebSocket('ws://localhost:8082/ws');
 
         ws.onopen = () => {
             setConnected(true);
