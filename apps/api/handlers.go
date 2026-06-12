@@ -182,13 +182,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	counts, err := s.deps.Store.CountByStatus(ctx)
 	if err != nil {
-		respondError(w, http.StatusInternalServerError, "count events: %v", err)
+		respondError(w, http.StatusInternalServerError, "count events: "+err.Error())
 		return
 	}
 
 	events, err := s.deps.Store.ListAll(ctx, 50)
 	if err != nil {
-		respondError(w, http.StatusInternalServerError, "list events: %v", err)
+		respondError(w, http.StatusInternalServerError, "list events: "+err.Error())
 		return
 	}
 
@@ -257,7 +257,7 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 		Invoice  string `json:"invoice,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, "decode request: %v", err)
+		respondError(w, http.StatusBadRequest, "decode request: "+err.Error())
 		return
 	}
 
@@ -295,7 +295,7 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.deps.Store.Create(ctx, event); err != nil {
-		respondError(w, http.StatusInternalServerError, "create event: %v", err)
+		respondError(w, http.StatusInternalServerError, "create event: "+err.Error())
 		return
 	}
 
@@ -357,10 +357,10 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		if evt.Invoice != "" {
 			payResult, payErr := s.deps.Alice.SendPayment(ctx, evt.Invoice, evt.AmountSats)
 			if payErr != nil {
-				log.Printf("Payment FAILED for %s: %v", evt.ID, payErr)
+				log.Printf("Payment failed for %s: %v", evt.ID, payErr)
 				evt.Transition(types.StatusFailed)
 			} else {
-				log.Printf("Payment SUCCEEDED for %s: preimage=%s, status=%s", evt.ID, payResult.Preimage, payResult.Status)
+				log.Printf("Payment succeeded for %s: preimage=%s", evt.ID, payResult.Preimage)
 				evt.Transition(types.StatusSettled)
 			}
 		} else {
@@ -388,4 +388,20 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		"message":   "Alice reconnected. Sync engine resumed.",
 		"reconcile": result,
 	})
+}
+
+// === RESPONSE HELPERS ===
+
+// respondJSON writes a JSON response with status code
+func respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("[ERROR] encoding JSON response: %v", err)
+	}
+}
+
+// respondError writes an error JSON response
+func respondError(w http.ResponseWriter, status int, message string) {
+	respondJSON(w, status, map[string]string{"error": message})
 }
