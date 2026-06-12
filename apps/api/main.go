@@ -62,14 +62,16 @@ func main() {
 
 	aliceClient := lightning.NewLNDClient(lightning.NodeConfig{
 		Name:         "Alice",
-		RPCAddr:      aliceRPCAddr,
+		/*RPCAddr:      aliceRPCAddr,*/
+		RestAddr:     "127.0.0.1:8080",
 		TLSCertPath:  homeDir + "/bootcamp-code/day3/alice/tls.cert",
 		MacaroonPath: homeDir + "/bootcamp-code/day3/alice/data/chain/bitcoin/regtest/admin.macaroon",
 	})
 
 	bobClient := lightning.NewLNDClient(lightning.NodeConfig{
 		Name:         "Bob",
-		RPCAddr:      bobRPCAddr,
+		/*RPCAddr:      bobRPCAddr,*/
+		RestAddr:     "127.0.0.1:8081",
 		TLSCertPath:  homeDir + "/bootcamp-code/day3/bob/tls.cert",
 		MacaroonPath: homeDir + "/bootcamp-code/day3/bob/data/chain/bitcoin/regtest/admin.macaroon",
 	})
