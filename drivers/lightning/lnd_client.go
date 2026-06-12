@@ -1,24 +1,25 @@
 // File: drivers/lightning/lnd_client.go
-// Purpose: Real LND gRPC client using official lightningnetwork/lnd protobuf definitions
+// Purpose: Real LND gRPC client using raw grpc.Invoke with JSON payloads
+// Connects to: interfaces.go (LightningDriver), api/handlers.go
+// Note: Uses google.golang.org/grpc directly, no protobuf generated code
+// LND gRPC accepts JSON-encoded messages on the wire for simple types
 
 package lightning
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 
-	"github.com/lightningnetwork/lnd/lnrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
-// LNDClient implements LightningDriver using real LND gRPC
+// LNDClient implements LightningDriver using raw gRPC
 type LNDClient struct {
 	conn         *grpc.ClientConn
-	client       lnrpc.LightningClient
 	name         string
 	RPCAddr      string
 	tlsPath      string
@@ -68,7 +69,6 @@ func (c *LNDClient) Connect() error {
 	}
 
 	c.conn = conn
-	c.client = lnrpc.NewLightningClient(conn)
 	c.connected = true
 	return nil
 }
@@ -87,15 +87,34 @@ func (c *LNDClient) IsConnected() bool {
 	return c.connected
 }
 
-// GetInfo returns real LND node identity
-func (c *LNDClient) GetInfo(ctx context.Context) (*NodeInfo, error) {
+// invoke performs a raw gRPC call with JSON request/response
+func (c *LNDClient) invoke(ctx context.Context, method string, req, resp interface{}) error {
 	if !c.connected {
-		return nil, fmt.Errorf("node %s not connected", c.name)
+		return fmt.Errorf("node %s not connected", c.name)
 	}
 
-	resp, err := c.client.GetInfo(ctx, &lnrpc.GetInfoRequest{})
+	reqBytes, err := json.Marshal(req)
 	if err != nil {
-		return nil, fmt.Errorf("getinfo: %w", err)
+		return fmt.Errorf("marshal request: %w", err)
+	}
+
+	err = c.conn.Invoke(ctx, "/lnrpc.Lightning/"+method, json.RawMessage(reqBytes), resp)
+	if err != nil {
+		return fmt.Errorf("invoke %s: %w", method, err)
+	}
+	return nil
+}
+
+// GetInfo returns real LND node identity
+func (c *LNDClient) GetInfo(ctx context.Context) (*NodeInfo, error) {
+	var resp struct {
+		Alias                 string `json:"alias"`
+		IdentityPubkey        string `json:"identity_pubkey"`
+		NumActiveChannels     uint32 `json:"num_active_channels"`
+		NumInactiveChannels   uint32 `json:"num_inactive_channels"`
+	}
+	if err := c.invoke(ctx, "GetInfo", struct{}{}, &resp); err != nil {
+		return nil, err
 	}
 
 	return &NodeInfo{
@@ -108,13 +127,13 @@ func (c *LNDClient) GetInfo(ctx context.Context) (*NodeInfo, error) {
 
 // GetWalletBalance returns real confirmed/unconfirmed balance
 func (c *LNDClient) GetWalletBalance(ctx context.Context) (*WalletBalance, error) {
-	if !c.connected {
-		return nil, fmt.Errorf("node %s not connected", c.name)
+	var resp struct {
+		TotalBalance       int64 `json:"total_balance"`
+		ConfirmedBalance   int64 `json:"confirmed_balance"`
+		UnconfirmedBalance int64 `json:"unconfirmed_balance"`
 	}
-
-	resp, err := c.client.WalletBalance(ctx, &lnrpc.WalletBalanceRequest{})
-	if err != nil {
-		return nil, fmt.Errorf("walletbalance: %w", err)
+	if err := c.invoke(ctx, "WalletBalance", struct{}{}, &resp); err != nil {
+		return nil, err
 	}
 
 	return &WalletBalance{
@@ -126,15 +145,23 @@ func (c *LNDClient) GetWalletBalance(ctx context.Context) (*WalletBalance, error
 
 // ListChannels returns real open channels
 func (c *LNDClient) ListChannels(ctx context.Context) ([]Channel, error) {
-	if !c.connected {
-		return nil, fmt.Errorf("node %s not connected", c.name)
+	var resp struct {
+		Channels []struct {
+			ChanId        uint64 `json:"chan_id,string"`
+			Capacity      int64  `json:"capacity,string"`
+			LocalBalance  int64  `json:"local_balance,string"`
+			RemoteBalance int64  `json:"remote_balance,string"`
+			Active        bool   `json:"active"`
+			RemotePubkey  string `json:"remote_pubkey"`
+		} `json:"channels"`
 	}
 
-	resp, err := c.client.ListChannels(ctx, &lnrpc.ListChannelsRequest{
-		ActiveOnly: false,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("listchannels: %w", err)
+	req := struct {
+		ActiveOnly bool `json:"active_only"`
+	}{ActiveOnly: false}
+
+	if err := c.invoke(ctx, "ListChannels", req, &resp); err != nil {
+		return nil, err
 	}
 
 	var channels []Channel
@@ -153,16 +180,21 @@ func (c *LNDClient) ListChannels(ctx context.Context) ([]Channel, error) {
 
 // AddInvoice creates a real BOLT 11 invoice
 func (c *LNDClient) AddInvoice(ctx context.Context, amountSats int64, memo string) (*InvoiceResult, error) {
-	if !c.connected {
-		return nil, fmt.Errorf("node %s not connected", c.name)
+	var resp struct {
+		PaymentRequest string `json:"payment_request"`
+		RHash          []byte `json:"r_hash"`
 	}
 
-	resp, err := c.client.AddInvoice(ctx, &lnrpc.Invoice{
+	req := struct {
+		Value int64  `json:"value,string"`
+		Memo  string `json:"memo"`
+	}{
 		Value: amountSats,
 		Memo:  memo,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("addinvoice: %w", err)
+	}
+
+	if err := c.invoke(ctx, "AddInvoice", req, &resp); err != nil {
+		return nil, err
 	}
 
 	return &InvoiceResult{
@@ -174,16 +206,25 @@ func (c *LNDClient) AddInvoice(ctx context.Context, amountSats int64, memo strin
 
 // SendPayment pays a real invoice via LND
 func (c *LNDClient) SendPayment(ctx context.Context, invoice string, amountSats int64) (*PaymentResult, error) {
-	if !c.connected {
-		return nil, fmt.Errorf("node %s not connected", c.name)
+	var resp struct {
+		PaymentError    string `json:"payment_error"`
+		PaymentHash     []byte `json:"payment_hash"`
+		PaymentPreimage []byte `json:"payment_preimage"`
+		PaymentRoute    struct {
+			TotalFees int64 `json:"total_fees,string"`
+		} `json:"payment_route"`
 	}
 
-	resp, err := c.client.SendPaymentSync(ctx, &lnrpc.SendRequest{
+	req := struct {
+		PaymentRequest string `json:"payment_request"`
+		Amt            int64  `json:"amt,string"`
+	}{
 		PaymentRequest: invoice,
 		Amt:            amountSats,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("sendpayment: %w", err)
+	}
+
+	if err := c.invoke(ctx, "SendPaymentSync", req, &resp); err != nil {
+		return nil, err
 	}
 
 	status := "failed"
@@ -197,39 +238,6 @@ func (c *LNDClient) SendPayment(ctx context.Context, invoice string, amountSats 
 		Preimage:    hex.EncodeToString(resp.PaymentPreimage),
 		FeeSats:     resp.PaymentRoute.TotalFees,
 	}, nil
-}
-
-// NodeInfo holds identity data
-type NodeInfo struct {
-	Alias    string `json:"alias"`
-	Pubkey   string `json:"pubkey"`
-	Channels int    `json:"channels"`
-	Status   string `json:"status"`
-}
-
-// WalletBalance holds satoshi balances
-type WalletBalance struct {
-	TotalBalance       int64 `json:"total_balance"`
-	ConfirmedBalance   int64 `json:"confirmed_balance"`
-	UnconfirmedBalance int64 `json:"unconfirmed_balance"`
-}
-
-// Channel represents a Lightning channel
-type Channel struct {
-	ChannelID     string `json:"channel_id"`
-	Capacity      int64  `json:"capacity"`
-	LocalBalance  int64  `json:"local_balance"`
-	RemoteBalance int64  `json:"remote_balance"`
-	Active        bool   `json:"active"`
-	RemotePubkey  string `json:"remote_pubkey"`
-}
-
-// PaymentResult holds payment outcome
-type PaymentResult struct {
-	Status      string `json:"status"`
-	PaymentHash string `json:"payment_hash"`
-	Preimage    string `json:"preimage,omitempty"`
-	FeeSats     int64  `json:"fee_sats,omitempty"`
 }
 
 // macaroonCredential implements gRPC PerRPCCredentials

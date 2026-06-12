@@ -1,5 +1,7 @@
 // File: drivers/bitcoin/rpc_client.go
-// Purpose: Bitcoin Core RPC client — live connection to regtest/mainnet node
+// Purpose: Bitcoin Core RPC adapter for blockchain and mempool queries
+// Connects to: api/handlers.go (GET /api/bitcoin/status)
+// Used by: dashboard BitcoinCore component
 
 package bitcoin
 
@@ -11,51 +13,29 @@ import (
 	"net/http"
 )
 
-// RPCClient connects to Bitcoin Core via JSON-RPC
+// RPCClient connects to Bitcoin Core JSON-RPC
 type RPCClient struct {
-	url      string
-	user     string
-	password string
-	client   *http.Client
+	host string
+	user string
+	pass string
 }
 
-// NewRPCClient creates a client for the given endpoint
-func NewRPCClient(host, user, password string) *RPCClient {
+// NewRPCClient creates a client with credentials
+func NewRPCClient(host, user, pass string) *RPCClient {
 	return &RPCClient{
-		url:      fmt.Sprintf("http://%s", host),
-		user:     user,
-		password: password,
-		client:   &http.Client{},
+		host: host,
+		user: user,
+		pass: pass,
 	}
 }
 
-// RPCRequest is the standard Bitcoin Core JSON-RPC envelope
-type RPCRequest struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params"`
-}
-
-// RPCResponse wraps all Bitcoin Core responses
-type RPCResponse struct {
-	Result json.RawMessage `json:"result"`
-	Error  *RPCError       `json:"error"`
-	ID     int             `json:"id"`
-}
-
-type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// call executes a raw RPC method and returns the result
-func (c *RPCClient) call(method string, params interface{}) (json.RawMessage, error) {
-	reqBody := RPCRequest{
-		JSONRPC: "1.0",
-		ID:      1,
-		Method:  method,
-		Params:  params,
+// rpcCall performs a generic JSON-RPC request
+func (c *RPCClient) rpcCall(method string, params []interface{}) (map[string]interface{}, error) {
+	reqBody := map[string]interface{}{
+		"jsonrpc": "1.0",
+		"id":      "meshguard",
+		"method":  method,
+		"params":  params,
 	}
 
 	data, err := json.Marshal(reqBody)
@@ -63,15 +43,15 @@ func (c *RPCClient) call(method string, params interface{}) (json.RawMessage, er
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.url, bytes.NewReader(data))
+	req, err := http.NewRequest("POST", "http://"+c.host, bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(c.user, c.password)
+	req.SetBasicAuth(c.user, c.pass)
 
-	resp, err := c.client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http request: %w", err)
 	}
@@ -82,79 +62,74 @@ func (c *RPCClient) call(method string, params interface{}) (json.RawMessage, er
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	var rpcResp RPCResponse
-	if err := json.Unmarshal(body, &rpcResp); err != nil {
+	var result struct {
+		Result map[string]interface{} `json:"result"`
+		Error  map[string]interface{} `json:"error"`
+	}
+
+	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
 
-	if rpcResp.Error != nil {
-		return nil, fmt.Errorf("rpc error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	if result.Error != nil {
+		return nil, fmt.Errorf("rpc error: %v", result.Error)
 	}
 
-	return rpcResp.Result, nil
+	return result.Result, nil
 }
 
-// BlockchainInfo mirrors getblockchaininfo response
-type BlockchainInfo struct {
-	Chain        string  `json:"chain"`
-	Blocks       int64   `json:"blocks"`
-	Headers      int64   `json:"headers"`
-	BestBlockHash string `json:"bestblockhash"`
-	Difficulty   float64 `json:"difficulty"`
-	VerificationProgress float64 `json:"verificationprogress"`
-}
-
-// GetBlockchainInfo returns current chain state
+// GetBlockchainInfo returns chain state
 func (c *RPCClient) GetBlockchainInfo() (*BlockchainInfo, error) {
-	result, err := c.call("getblockchaininfo", nil)
+	result, err := c.rpcCall("getblockchaininfo", []interface{}{})
 	if err != nil {
-		return nil, fmt.Errorf("getblockchaininfo: %w", err)
+		return nil, err
 	}
 
-	var info BlockchainInfo
-	if err := json.Unmarshal(result, &info); err != nil {
-		return nil, fmt.Errorf("parse blockchaininfo: %w", err)
+	info := &BlockchainInfo{}
+	if chain, ok := result["chain"].(string); ok {
+		info.Chain = chain
 	}
-	return &info, nil
+	if blocks, ok := result["blocks"].(float64); ok {
+		info.Blocks = int64(blocks)
+	}
+	if headers, ok := result["headers"].(float64); ok {
+		info.Headers = int64(headers)
+	}
+	if hash, ok := result["bestblockhash"].(string); ok {
+		info.BestBlockHash = hash
+	}
+
+	return info, nil
 }
 
-// MempoolInfo mirrors getmempoolinfo response
+// GetMempoolInfo returns mempool statistics
+func (c *RPCClient) GetMempoolInfo() (*MempoolInfo, error) {
+	result, err := c.rpcCall("getmempoolinfo", []interface{}{})
+	if err != nil {
+		return nil, err
+	}
+
+	info := &MempoolInfo{}
+	if size, ok := result["size"].(float64); ok {
+		info.Size = int64(size)
+	}
+	if bytes, ok := result["bytes"].(float64); ok {
+		info.Bytes = int64(bytes)
+	}
+
+	return info, nil
+}
+
+// BlockchainInfo holds chain state
+type BlockchainInfo struct {
+	Chain         string `json:"chain"`
+	Blocks        int64  `json:"blocks"`
+	Headers       int64  `json:"headers"`
+	BestBlockHash string `json:"bestblockhash"`
+}
+
+// MempoolInfo holds mempool statistics
 type MempoolInfo struct {
 	Size  int64 `json:"size"`
 	Bytes int64 `json:"bytes"`
-	Usage int64 `json:"usage"`
-}
-
-// GetMempoolInfo returns current mempool state
-func (c *RPCClient) GetMempoolInfo() (*MempoolInfo, error) {
-	result, err := c.call("getmempoolinfo", nil)
-	if err != nil {
-		return nil, fmt.Errorf("getmempoolinfo: %w", err)
-	}
-
-	var info MempoolInfo
-	if err := json.Unmarshal(result, &info); err != nil {
-		return nil, fmt.Errorf("parse mempoolinfo: %w", err)
-	}
-	return &info, nil
-}
-
-// GetBlockCount returns current block height
-func (c *RPCClient) GetBlockCount() (int64, error) {
-	result, err := c.call("getblockcount", nil)
-	if err != nil {
-		return 0, err
-	}
-
-	var count int64
-	if err := json.Unmarshal(result, &count); err != nil {
-		return 0, fmt.Errorf("parse blockcount: %w", err)
-	}
-	return count, nil
-}
-
-// HealthCheck verifies Bitcoin Core is reachable
-func (c *RPCClient) HealthCheck() error {
-	_, err := c.GetBlockCount()
-	return err
 }
