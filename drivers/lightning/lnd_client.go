@@ -1,5 +1,5 @@
 // File: drivers/lightning/lnd_client.go
-// Purpose: Real LND REST API client
+// Purpose: Real LND REST API client with lncli fallback for LND 0.21.99-beta
 // Connects to: interfaces.go (LightningDriver), api/handlers.go
 // Note: Uses LND REST API with HTTP + macaroon auth, no gRPC/protobuf
 
@@ -13,8 +13,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -243,26 +246,33 @@ func (c *LNDClient) AddInvoice(ctx context.Context, amountSats int64, memo strin
 }
 
 // SendPayment pays an invoice via the Lightning Network
-// FIX: Uses /v1/payments endpoint (correct for LND 0.21.99)
 func (c *LNDClient) SendPayment(ctx context.Context, invoice string, amountSats int64) (*PaymentResult, error) {
+	log.Printf("[PAY] Starting payment: node=%s, amount=%d", c.name, amountSats)
+
+	// 1. Try lncli first (isolated context)
+	result, cliErr := c.sendPaymentViaCLI(invoice)
+	if cliErr == nil {
+		log.Printf("[PAY] lncli SUCCESS: hash=%s", result.PaymentHash)
+		return result, nil
+	}
+	log.Printf("[PAY] lncli FAILED: %v", cliErr)
+
+	// 2. REST fallback
+	log.Printf("[PAY] Falling back to REST...")
 	reqBody := map[string]interface{}{
 		"payment_request": invoice,
-		"fee_limit": map[string]interface{}{
-			"fixed": 1000,
-		},
+		"fee_limit":       map[string]interface{}{"fixed": 1000},
 	}
 
-	// Primary: /v1/payments (LND 0.21.99+)
 	data, err := c.restCall(ctx, "POST", "/v1/payments", reqBody)
 	if err != nil {
-		// Fallback: /v1/channels/transactions (older versions)
 		data, err = c.restCall(ctx, "POST", "/v1/channels/transactions", reqBody)
 		if err != nil {
-			return nil, fmt.Errorf("send payment failed: %w", err)
+			return nil, fmt.Errorf("all methods failed (lncli: %v, rest: %w)", cliErr, err)
 		}
 	}
 
-	// Handle both response formats
+	// Parse REST response
 	var resp struct {
 		Status          string `json:"status"`
 		PaymentError    string `json:"payment_error"`
@@ -271,10 +281,9 @@ func (c *LNDClient) SendPayment(ctx context.Context, invoice string, amountSats 
 		TotalFees       int64  `json:"total_fees,string"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("unmarshal payment: %w", err)
+		return nil, fmt.Errorf("unmarshal rest payment: %w", err)
 	}
 
-	// Determine status — LND 0.21.99 uses "SUCCEEDED" or "FAILED"
 	status := "settled"
 	if resp.Status == "FAILED" || resp.PaymentError != "" {
 		status = "failed"
@@ -285,6 +294,85 @@ func (c *LNDClient) SendPayment(ctx context.Context, invoice string, amountSats 
 		PaymentHash: resp.PaymentHash,
 		Preimage:    resp.PaymentPreimage,
 		FeeSats:     resp.TotalFees,
+	}, nil
+}
+
+// sendPaymentViaCLI uses lncli shell command to send payment
+func (c *LNDClient) sendPaymentViaCLI(invoice string) (*PaymentResult, error) {
+	lncliPath := "/home/aturo/go/bin/lncli"
+	if _, err := os.Stat(lncliPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("lncli binary not found at %s", lncliPath)
+	}
+
+	var rpcServer, tlsCertPath, macaroonPath string
+	switch c.name {
+	case "Alice":
+		rpcServer = "127.0.0.1:10009"
+		tlsCertPath = c.tlsPath
+		macaroonPath = c.macaroonPath
+	case "Bob":
+		rpcServer = "127.0.0.1:10010"
+		tlsCertPath = c.tlsPath
+		macaroonPath = c.macaroonPath
+	default:
+		return nil, fmt.Errorf("unknown node: %s", c.name)
+	}
+
+	// CRITICAL: Create fresh timeout so HTTP handler cancellation doesn't kill lncli
+	cmdCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(cmdCtx, lncliPath,
+		"--network=regtest",
+		"--rpcserver="+rpcServer,
+		"--tlscertpath="+tlsCertPath,
+		"--macaroonpath="+macaroonPath,
+		"sendpayment",
+		"--pay_req="+invoice,
+		"--force",
+	)
+
+	// Explicit environment setup
+	homeDir, _ := os.UserHomeDir()
+	cmd.Env = append(os.Environ(), "HOME="+homeDir)
+	cmd.Dir = "/" // Avoid weird working directory issues
+
+	log.Printf("[LNCLI] Executing: %s %s", lncliPath, strings.Join(cmd.Args[1:], " "))
+
+	output, err := cmd.CombinedOutput()
+	outStr := string(output)
+
+	if err != nil {
+		log.Printf("[LNCLI] EXEC ERROR: %v | Output: %s", err, outStr)
+		return nil, fmt.Errorf("lncli exec failed: %v", err)
+	}
+
+	log.Printf("[LNCLI] RAW OUTPUT: %s", outStr)
+
+	if !strings.Contains(outStr, "SUCCEEDED") {
+		return nil, fmt.Errorf("lncli did not succeed: %s", outStr)
+	}
+
+	// Parse hash & preimage from text output
+	hash := "unknown"
+	preimage := "unknown"
+	for _, line := range strings.Split(outStr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Payment hash:") {
+			hash = strings.TrimSpace(strings.TrimPrefix(line, "Payment hash:"))
+		}
+		if strings.Contains(line, "preimage:") {
+			parts := strings.Split(line, "preimage:")
+			if len(parts) > 1 {
+				preimage = strings.TrimSpace(strings.Split(parts[1], ",")[0])
+			}
+		}
+	}
+
+	return &PaymentResult{
+		Status:      "settled",
+		PaymentHash: hash,
+		Preimage:    preimage,
 	}, nil
 }
 
