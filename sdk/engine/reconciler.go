@@ -1,5 +1,7 @@
 // File: sdk/engine/reconciler.go
 // Purpose: Conflict resolution and state reconciliation engine
+// Connects to: types (MeshGuardEvent, ReconcileResult), queue (EventStore)
+// Used by: api/handlers.go
 
 package engine
 
@@ -9,17 +11,18 @@ import (
 	"time"
 
 	"meshguard/sdk/queue"
+	"meshguard/sdk/types"
 )
 
 // Reconciler processes pending events when connectivity returns
 type Reconciler struct {
 	store  queue.EventStore
-	clock  *SequenceClock
+	clock  *types.SequenceClock
 	active bool
 }
 
 // NewReconciler creates a reconciler bound to an event store
-func NewReconciler(store queue.EventStore, clock *SequenceClock) *Reconciler {
+func NewReconciler(store queue.EventStore, clock *types.SequenceClock) *Reconciler {
 	return &Reconciler{
 		store:  store,
 		clock:  clock,
@@ -28,24 +31,24 @@ func NewReconciler(store queue.EventStore, clock *SequenceClock) *Reconciler {
 }
 
 // Reconcile processes all QUEUED and OFFLINE events
-func (r *Reconciler) Reconcile(ctx context.Context) (*ReconcileResult, error) {
+func (r *Reconciler) Reconcile(ctx context.Context) (*types.ReconcileResult, error) {
 	if !r.active {
 		return nil, fmt.Errorf("reconciler paused")
 	}
 
-	pending, err := r.store.ListByStatus(ctx, StatusQueued)
+	pending, err := r.store.ListByStatus(ctx, types.StatusQueued)
 	if err != nil {
 		return nil, fmt.Errorf("list queued: %w", err)
 	}
 
-	offline, err := r.store.ListByStatus(ctx, StatusOffline)
+	offline, err := r.store.ListByStatus(ctx, types.StatusOffline)
 	if err != nil {
 		return nil, fmt.Errorf("list offline: %w", err)
 	}
 
 	pending = append(pending, offline...)
 
-	result := &ReconcileResult{
+	result := &types.ReconcileResult{
 		Processed: 0,
 		Failed:    0,
 		Remaining: len(pending),
@@ -53,7 +56,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*ReconcileResult, error) {
 	}
 
 	for _, event := range pending {
-		if err := event.Transition(StatusReconciling); err != nil {
+		if err := event.Transition(types.StatusReconciling); err != nil {
 			result.Failed++
 			continue
 		}
@@ -71,26 +74,14 @@ func (r *Reconciler) Reconcile(ctx context.Context) (*ReconcileResult, error) {
 	return result, nil
 }
 
-// Pause stops the reconciler (simulates offline mode)
 func (r *Reconciler) Pause() {
 	r.active = false
 }
 
-// Resume restarts the reconciler (simulates reconnect)
 func (r *Reconciler) Resume() {
 	r.active = true
 }
 
-// IsActive returns current reconciler state
 func (r *Reconciler) IsActive() bool {
 	return r.active
-}
-
-// ReconcileResult summarizes a reconciliation run
-type ReconcileResult struct {
-	Processed int       `json:"processed"`
-	Failed    int       `json:"failed"`
-	Remaining int       `json:"remaining"`
-	StartTime time.Time `json:"start_time"`
-	EndTime   time.Time `json:"end_time"`
 }
