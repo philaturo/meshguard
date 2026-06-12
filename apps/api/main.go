@@ -91,7 +91,7 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":8082",
 		Handler: server.Router(),
 	}
 
@@ -109,7 +109,7 @@ func main() {
 		}
 	}()
 
-	log.Println("MeshGuard API listening on http://localhost:8080")
+	log.Println("MeshGuard API listening on http://localhost:8082")
 	log.Println("Dashboard available at http://localhost:5173")
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
