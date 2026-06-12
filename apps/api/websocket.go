@@ -66,7 +66,6 @@ func (h *Hub) Run() {
 				select {
 				case client.send <- message:
 				default:
-					// Client buffer full, drop message
 				}
 			}
 			h.mu.RUnlock()
@@ -88,7 +87,7 @@ func (h *Hub) Broadcast(payload interface{}) {
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all origins for development
+			return true
 		},
 	}
 
@@ -106,7 +105,6 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	s.hub.register <- client
 
-	// Start goroutines for read/write
 	go client.writePump()
 	go client.readPump()
 }
@@ -126,7 +124,6 @@ func (c *Client) readPump() {
 			}
 			break
 		}
-		// Client messages not required for MVP (one-way broadcast)
 	}
 }
 

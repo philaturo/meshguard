@@ -2,7 +2,7 @@
 // Purpose: HTTP server entry point — initializes all drivers, SDK, and routes
 // Connects to: handlers.go (REST endpoints), websocket.go (real-time push)
 // Drivers: bitcoin/rpc_client.go, lightning/lnd_client.go
-// SDK: queue/sqlite_store.go, engine/reconciler.go
+// SDK: queue/sqlite_store.go, engine/reconciler.go, types (SequenceClock, MeshGuardEvent)
 // Usage: go run apps/api/main.go or ./bin/meshguard-api
 
 package main
@@ -20,46 +20,41 @@ import (
 	"meshguard/drivers/lightning"
 	"meshguard/sdk/engine"
 	"meshguard/sdk/queue"
+	"meshguard/sdk/types"
 )
 
 const (
-	dataDir         = "./data"
-	dbPath          = dataDir + "/meshguard.db"
-	bitcoinRPCHost  = "localhost:18443"
-	bitcoinRPCUser  = "bootcamp"
-	bitcoinRPCPass  = "bootcamp123"
-	aliceRPCAddr    = "localhost:10009"
-	bobRPCAddr      = "localhost:10010"
+	dataDir        = "./data"
+	dbPath           = dataDir + "/meshguard.db"
+	bitcoinRPCHost   = "localhost:18443"
+	bitcoinRPCUser   = "bootcamp"
+	bitcoinRPCPass   = "bootcamp123"
+	aliceRPCAddr     = "localhost:10009"
+	bobRPCAddr       = "localhost:10010"
 )
 
 func main() {
-	// Ensure data directory exists
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		log.Fatalf("create data dir: %v", err)
 	}
 
-	// Initialize SQLite store
 	store, err := queue.NewSQLiteStore(dbPath)
 	if err != nil {
 		log.Fatalf("init store: %v", err)
 	}
 	defer store.Close()
 
-	// Initialize sequence clock from highest existing sequence
 	events, err := store.ListAll(context.Background(), 1)
 	var startSeq uint64
 	if len(events) > 0 {
 		startSeq = events[0].Sequence
 	}
-	clock := engine.NewSequenceClock(startSeq)
+	clock := types.NewSequenceClock(startSeq)
 
-	// Initialize reconciler
 	reconciler := engine.NewReconciler(store, clock)
 
-	// Initialize Bitcoin Core RPC (live connection)
 	btcClient := bitcoin.NewRPCClient(bitcoinRPCHost, bitcoinRPCUser, bitcoinRPCPass)
 
-	// Initialize LND clients (deferred connection until nodes are ready)
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("get home dir: %v", err)
@@ -79,7 +74,6 @@ func main() {
 		MacaroonPath: homeDir + "/bootcamp-code/day3/bob/data/chain/bitcoin/regtest/admin.macaroon",
 	})
 
-	// Attempt initial connections (non-fatal if nodes not ready)
 	if err := aliceClient.Connect(); err != nil {
 		log.Printf("Alice not ready: %v", err)
 	}
@@ -87,23 +81,20 @@ func main() {
 		log.Printf("Bob not ready: %v", err)
 	}
 
-	// Build server with all dependencies
 	server := NewServer(ServerDeps{
-		Store:       store,
-		Clock:       clock,
-		Reconciler:  reconciler,
-		Bitcoin:     btcClient,
-		Alice:       aliceClient,
-		Bob:         bobClient,
+		Store:      store,
+		Clock:      clock,
+		Reconciler: reconciler,
+		Bitcoin:    btcClient,
+		Alice:      aliceClient,
+		Bob:        bobClient,
 	})
 
-	// HTTP server
 	srv := &http.Server{
 		Addr:    ":8080",
 		Handler: server.Router(),
 	}
 
-	// Graceful shutdown
 	go func() {
 		sigChan := make(chan os.Signal, 1)
 		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -128,7 +119,7 @@ func main() {
 // ServerDeps holds all injected dependencies for the HTTP server
 type ServerDeps struct {
 	Store      queue.EventStore
-	Clock      *engine.SequenceClock
+	Clock      *types.SequenceClock
 	Reconciler *engine.Reconciler
 	Bitcoin    *bitcoin.RPCClient
 	Alice      lightning.LightningDriver

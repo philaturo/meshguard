@@ -24,7 +24,7 @@ import (
 	"github.com/gorilla/mux"
 	"meshguard/drivers/bitcoin"
 	"meshguard/drivers/lightning"
-	"meshguard/sdk/engine"
+	"meshguard/sdk/types"
 )
 
 // Server holds all HTTP handlers with injected dependencies
@@ -45,7 +45,6 @@ func NewServer(deps ServerDeps) *Server {
 func (s *Server) Router() *mux.Router {
 	r := mux.NewRouter()
 
-	// API routes
 	api := r.PathPrefix("/api").Subrouter()
 
 	api.HandleFunc("/bitcoin/status", s.handleBitcoinStatus).Methods("GET")
@@ -58,10 +57,8 @@ func (s *Server) Router() *mux.Router {
 	api.HandleFunc("/payment", s.handleCreatePayment).Methods("POST")
 	api.HandleFunc("/reconnect", s.handleReconnect).Methods("POST")
 
-	// WebSocket endpoint
 	r.HandleFunc("/ws", s.handleWebSocket)
 
-	// Start WebSocket hub
 	go s.hub.Run()
 
 	return r
@@ -213,9 +210,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, http.StatusOK, map[string]interface{}{
 		"counts": map[string]interface{}{
-			"pending": counts[engine.StatusQueued] + counts[engine.StatusOffline],
-			"settled": counts[engine.StatusSettled],
-			"failed":  counts[engine.StatusFailed],
+			"pending": counts[types.StatusQueued] + counts[types.StatusOffline],
+			"settled": counts[types.StatusSettled],
+			"failed":  counts[types.StatusFailed],
 		},
 		"events": formatted,
 	})
@@ -264,10 +261,10 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event := &engine.MeshGuardEvent{
+	event := &types.MeshGuardEvent{
 		ID:         fmt.Sprintf("evt-%d", s.deps.Clock.Next()),
-		Type:       engine.EventTypePayment,
-		Status:     engine.StatusCreated,
+		Type:       types.EventTypePayment,
+		Status:     types.StatusCreated,
 		FromNode:   req.FromNode,
 		ToNode:     req.ToNode,
 		AmountSats: req.Amount,
@@ -279,9 +276,9 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.deps.Reconciler.IsActive() || !s.deps.Alice.IsConnected() {
-		event.Status = engine.StatusOffline
+		event.Status = types.StatusOffline
 	} else {
-		event.Status = engine.StatusQueued
+		event.Status = types.StatusQueued
 	}
 
 	if err := s.deps.Store.Create(ctx, event); err != nil {
@@ -306,7 +303,6 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// Reconnect Alice to LND
 	if err := s.deps.Alice.Connect(); err != nil {
 		respondJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
 			"status":  "partial",
@@ -316,10 +312,8 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resume sync engine
 	s.deps.Reconciler.Resume()
 
-	// Process pending events
 	result, err := s.deps.Reconciler.Reconcile(ctx)
 	if err != nil {
 		respondJSON(w, http.StatusOK, map[string]interface{}{
@@ -330,15 +324,13 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Attempt settlement for each reconciled event
-	pending, _ := s.deps.Store.ListByStatus(ctx, engine.StatusReconciling)
+	pending, _ := s.deps.Store.ListByStatus(ctx, types.StatusReconciling)
 	for _, evt := range pending {
-		// Attempt LND payment
 		_, payErr := s.deps.Alice.SendPayment(ctx, evt.Invoice, evt.AmountSats)
 		if payErr != nil {
-			evt.Transition(engine.StatusFailed)
+			evt.Transition(types.StatusFailed)
 		} else {
-			evt.Transition(engine.StatusSettled)
+			evt.Transition(types.StatusSettled)
 		}
 		s.deps.Store.Update(ctx, evt)
 
@@ -349,7 +341,6 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Broadcast reconnection
 	s.hub.Broadcast(map[string]interface{}{
 		"type":   "node_status",
 		"node":   "Alice",
