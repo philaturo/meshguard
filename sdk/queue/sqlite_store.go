@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"meshguard/sdk/engine"
+	"meshguard/sdk/types"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -37,7 +37,6 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	return store, nil
 }
 
-// migrate creates the events table if not exists
 func (s *SQLiteStore) migrate() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS events (
@@ -57,7 +56,6 @@ func (s *SQLiteStore) migrate() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
-
 	CREATE INDEX IF NOT EXISTS idx_status ON events(status);
 	CREATE INDEX IF NOT EXISTS idx_sequence ON events(sequence);
 	CREATE INDEX IF NOT EXISTS idx_created ON events(created_at);
@@ -66,8 +64,7 @@ func (s *SQLiteStore) migrate() error {
 	return err
 }
 
-// Create inserts a new event
-func (s *SQLiteStore) Create(ctx context.Context, event *engine.MeshGuardEvent) error {
+func (s *SQLiteStore) Create(ctx context.Context, event *types.MeshGuardEvent) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO events (id, type, status, from_node, to_node, amount_sats, channel_id,
 			sequence, timestamp, payload, signature, htlc_hash, invoice, created_at, updated_at)
@@ -75,26 +72,22 @@ func (s *SQLiteStore) Create(ctx context.Context, event *engine.MeshGuardEvent) 
 	`, event.ID, event.Type, event.Status, event.FromNode, event.ToNode, event.AmountSats,
 		event.ChannelID, event.Sequence, event.Timestamp, event.Payload, event.Signature,
 		event.HTLCHash, event.Invoice, event.CreatedAt, event.UpdatedAt)
-
 	if err != nil {
 		return fmt.Errorf("insert event: %w", err)
 	}
 	return nil
 }
 
-// Get retrieves an event by ID
-func (s *SQLiteStore) Get(ctx context.Context, id string) (*engine.MeshGuardEvent, error) {
+func (s *SQLiteStore) Get(ctx context.Context, id string) (*types.MeshGuardEvent, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, type, status, from_node, to_node, amount_sats, channel_id,
 			sequence, timestamp, payload, signature, htlc_hash, invoice, created_at, updated_at
 		FROM events WHERE id = ?
 	`, id)
-
 	return s.scanEvent(row)
 }
 
-// ListByStatus returns events filtered by status, ordered by sequence
-func (s *SQLiteStore) ListByStatus(ctx context.Context, status engine.EventStatus) ([]*engine.MeshGuardEvent, error) {
+func (s *SQLiteStore) ListByStatus(ctx context.Context, status types.EventStatus) ([]*types.MeshGuardEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, type, status, from_node, to_node, amount_sats, channel_id,
 			sequence, timestamp, payload, signature, htlc_hash, invoice, created_at, updated_at
@@ -104,12 +97,10 @@ func (s *SQLiteStore) ListByStatus(ctx context.Context, status engine.EventStatu
 		return nil, fmt.Errorf("query by status: %w", err)
 	}
 	defer rows.Close()
-
 	return s.scanEvents(rows)
 }
 
-// ListAll returns all events ordered by sequence descending
-func (s *SQLiteStore) ListAll(ctx context.Context, limit int) ([]*engine.MeshGuardEvent, error) {
+func (s *SQLiteStore) ListAll(ctx context.Context, limit int) ([]*types.MeshGuardEvent, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, type, status, from_node, to_node, amount_sats, channel_id,
 			sequence, timestamp, payload, signature, htlc_hash, invoice, created_at, updated_at
@@ -119,34 +110,29 @@ func (s *SQLiteStore) ListAll(ctx context.Context, limit int) ([]*engine.MeshGua
 		return nil, fmt.Errorf("query all: %w", err)
 	}
 	defer rows.Close()
-
 	return s.scanEvents(rows)
 }
 
-// CountByStatus returns counts per status for dashboard metrics
-func (s *SQLiteStore) CountByStatus(ctx context.Context) (map[engine.EventStatus]int, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT status, COUNT(*) FROM events GROUP BY status
-	`)
+func (s *SQLiteStore) CountByStatus(ctx context.Context) (map[types.EventStatus]int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT status, COUNT(*) FROM events GROUP BY status`)
 	if err != nil {
 		return nil, fmt.Errorf("count status: %w", err)
 	}
 	defer rows.Close()
 
-	counts := make(map[engine.EventStatus]int)
+	counts := make(map[types.EventStatus]int)
 	for rows.Next() {
 		var status string
 		var count int
 		if err := rows.Scan(&status, &count); err != nil {
 			return nil, err
 		}
-		counts[engine.EventStatus(status)] = count
+		counts[types.EventStatus(status)] = count
 	}
 	return counts, nil
 }
 
-// Update modifies an existing event
-func (s *SQLiteStore) Update(ctx context.Context, event *engine.MeshGuardEvent) error {
+func (s *SQLiteStore) Update(ctx context.Context, event *types.MeshGuardEvent) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE events SET
 			type = ?, status = ?, from_node = ?, to_node = ?, amount_sats = ?,
@@ -156,27 +142,23 @@ func (s *SQLiteStore) Update(ctx context.Context, event *engine.MeshGuardEvent) 
 	`, event.Type, event.Status, event.FromNode, event.ToNode, event.AmountSats,
 		event.ChannelID, event.Sequence, event.Timestamp, event.Payload, event.Signature,
 		event.HTLCHash, event.Invoice, time.Now(), event.ID)
-
 	if err != nil {
 		return fmt.Errorf("update event: %w", err)
 	}
 	return nil
 }
 
-// Delete removes an event
 func (s *SQLiteStore) Delete(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM events WHERE id = ?`, id)
 	return err
 }
 
-// Close closes the database connection
 func (s *SQLiteStore) Close() error {
 	return s.db.Close()
 }
 
-// scanEvent reads a single row into MeshGuardEvent
-func (s *SQLiteStore) scanEvent(row *sql.Row) (*engine.MeshGuardEvent, error) {
-	var e engine.MeshGuardEvent
+func (s *SQLiteStore) scanEvent(row *sql.Row) (*types.MeshGuardEvent, error) {
+	var e types.MeshGuardEvent
 	var ts, created, updated string
 
 	err := row.Scan(
@@ -198,11 +180,10 @@ func (s *SQLiteStore) scanEvent(row *sql.Row) (*engine.MeshGuardEvent, error) {
 	return &e, nil
 }
 
-// scanEvents reads multiple rows
-func (s *SQLiteStore) scanEvents(rows *sql.Rows) ([]*engine.MeshGuardEvent, error) {
-	var events []*engine.MeshGuardEvent
+func (s *SQLiteStore) scanEvents(rows *sql.Rows) ([]*types.MeshGuardEvent, error) {
+	var events []*types.MeshGuardEvent
 	for rows.Next() {
-		var e engine.MeshGuardEvent
+		var e types.MeshGuardEvent
 		var ts, created, updated string
 
 		err := rows.Scan(
