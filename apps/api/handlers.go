@@ -30,7 +30,7 @@ import (
 // Server holds all HTTP handlers with injected dependencies
 type Server struct {
 	deps ServerDeps
-	hub  *Hub // WebSocket hub for real-time broadcasts
+	hub  *Hub
 }
 
 // NewServer creates a server with the given dependencies
@@ -246,7 +246,7 @@ func (s *Server) handleGoOffline(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleCreatePayment creates a payment event
+// handleCreatePayment creates a payment event with invoice generation
 func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
@@ -268,13 +268,26 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 		FromNode:   req.FromNode,
 		ToNode:     req.ToNode,
 		AmountSats: req.Amount,
-		Invoice:    req.Invoice,
 		Sequence:   s.deps.Clock.Next(),
 		Timestamp:  time.Now(),
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
 
+	// Create invoice from Bob if not provided — ensures reconciliation can execute payment
+	if req.Invoice == "" && req.ToNode == "Bob" {
+		invoiceResult, err := s.deps.Bob.AddInvoice(ctx, req.Amount, fmt.Sprintf("Payment from %s", req.FromNode))
+		if err != nil {
+			log.Printf("invoice creation failed: %v", err)
+		} else {
+			event.Invoice = invoiceResult.PaymentRequest
+			log.Printf("Created invoice for event %s: %s", event.ID, event.Invoice)
+		}
+	} else {
+		event.Invoice = req.Invoice
+	}
+
+	// Determine status based on network state
 	if !s.deps.Reconciler.IsActive() || !s.deps.Alice.IsConnected() {
 		event.Status = types.StatusOffline
 	} else {
@@ -289,13 +302,13 @@ func (s *Server) handleCreatePayment(w http.ResponseWriter, r *http.Request) {
 	s.hub.Broadcast(map[string]interface{}{
 		"type":    "new_event",
 		"event":   event,
-		"message": fmt.Sprintf("Payment %s created: %d sats %s -> %s", event.ID, event.AmountSats, event.FromNode, event.ToNode),
+		"message": fmt.Sprintf("Payment %s: %d sats %s -> %s", event.ID, event.AmountSats, event.FromNode, event.ToNode),
 	})
 
 	respondJSON(w, http.StatusCreated, map[string]interface{}{
 		"event":   event,
 		"status":  event.Status,
-		"message": fmt.Sprintf("Payment queued. Status: %s", event.Status),
+		"message": fmt.Sprintf("Payment %s. Status: %s", map[bool]string{true: "queued", false: "stored"}[event.Status == types.StatusQueued], event.Status),
 	})
 }
 
@@ -324,14 +337,37 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Process reconciling events — attempt actual Lightning payment
 	pending, _ := s.deps.Store.ListByStatus(ctx, types.StatusReconciling)
 	for _, evt := range pending {
-		_, payErr := s.deps.Alice.SendPayment(ctx, evt.Invoice, evt.AmountSats)
-		if payErr != nil {
-			evt.Transition(types.StatusFailed)
-		} else {
-			evt.Transition(types.StatusSettled)
+		// If no invoice, try to create one now via Bob
+		if evt.Invoice == "" && evt.ToNode == "Bob" {
+			invoiceResult, err := s.deps.Bob.AddInvoice(ctx, evt.AmountSats, fmt.Sprintf("Payment from %s", evt.FromNode))
+			if err != nil {
+				log.Printf("Failed to create invoice for %s: %v", evt.ID, err)
+				evt.Transition(types.StatusFailed)
+				s.deps.Store.Update(ctx, evt)
+				continue
+			}
+			evt.Invoice = invoiceResult.PaymentRequest
+			log.Printf("Created invoice for %s: %s", evt.ID, evt.Invoice)
 		}
+
+		// Attempt payment via Alice
+		if evt.Invoice != "" {
+			payResult, payErr := s.deps.Alice.SendPayment(ctx, evt.Invoice, evt.AmountSats)
+			if payErr != nil {
+				log.Printf("Payment FAILED for %s: %v", evt.ID, payErr)
+				evt.Transition(types.StatusFailed)
+			} else {
+				log.Printf("Payment SUCCEEDED for %s: preimage=%s, status=%s", evt.ID, payResult.Preimage, payResult.Status)
+				evt.Transition(types.StatusSettled)
+			}
+		} else {
+			log.Printf("No invoice for %s, marking failed", evt.ID)
+			evt.Transition(types.StatusFailed)
+		}
+
 		s.deps.Store.Update(ctx, evt)
 
 		s.hub.Broadcast(map[string]interface{}{
@@ -351,19 +387,5 @@ func (s *Server) handleReconnect(w http.ResponseWriter, r *http.Request) {
 		"status":    "online",
 		"message":   "Alice reconnected. Sync engine resumed.",
 		"reconcile": result,
-	})
-}
-
-// respondJSON sends a JSON response with the given status code
-func respondJSON(w http.ResponseWriter, code int, payload interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(payload)
-}
-
-// respondError sends a formatted error response
-func respondError(w http.ResponseWriter, code int, format string, args ...interface{}) {
-	respondJSON(w, code, map[string]interface{}{
-		"error": fmt.Sprintf(format, args...),
 	})
 }
